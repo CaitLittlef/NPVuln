@@ -1,0 +1,1200 @@
+title: "SLR_StormSurge_SINGLEPARKS"
+author: "CaitLittlef"
+date: "October 4, 2017"
+output: html_document
+---
+
+
+FIXME:
+Consider changing st_transform PARK to match SLR/LOW layers, not vice versa.
+Pros: only transform one layer, not 4.
+Cons: end up with each park having baseline & projection layers w/ diff CRS.
+
+
+
+```{r SETUP}
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln")
+
+# install.packages("sf")
+# install.packages("rgdal")
+# install.packages("rgeos")
+# install.packages("raster")
+# install.packages("tidyverse")
+# install.packages("dplyr")
+# install.packages("mapview")
+# install.packages("geosphere")
+# install.packages("microbenchmark")
+
+
+library(sf)
+library(rgdal)
+library(rgeos)
+library(raster)
+library(tidyverse)
+library(dplyr)
+library(mapview)
+library(geosphere)
+library(microbenchmark)
+
+
+# Load SLR & Surge .gdbs
+slr.db <- "//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln/GIS/NPS/SLR/SLR_vs2.gdb"
+surge.db <- "//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln/GIS/NPS/StormSurge/Surge_vs2.gdb"
+```
+
+```{r PROCESS PARK SHAPEFILES}
+# GOAL: extract (or reference) individual park boundaries from shapefile below.
+parks <- st_read(dsn = slr.db, layer = "NPS_park_boundary_coast") %>%
+  st_buffer(dist = 0) # fix invalid geometries (warning re: lat/long vs. dd)
+class(parks) # sf: simple feature; info as data.frame
+# 118 data observations at 115 levels (i.e., UNIT_CODE) with 118 obs; 23 variables
+parks <- parks[,-(2:19)] # Drops all variables except FileName, shape info.
+
+# 3 UNIT_CODES are for both park & associated reserve (GLBA, KATM, WRST)
+# Dissolve those 3x2 instances into 3x1 obs --> 115 obs
+parks <- parks %>%
+  group_by(UNIT_CODE) %>%  
+  summarise() # tried summarise(AREA = sum(Shape_Area)) but later got carried as num. not real area. 
+# Dunno why, but parks is now sfc_GEOMETRY not MULTIPOLYGON. 
+parks <- st_cast(parks) # Re-convert to MULTIPOLYGON, else probs with join
+
+# Load in look-up table for SLR domains representing multiple parks (UNIT_CODE)...
+# ...& YES/NO for precise to actual projection layers. Src: NPS file 0Readme_Domains_vs2.xlsx
+lu.domains <- read.csv("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln/GIS/NPS/SLR/lu_unit_domains.csv")
+parks <- left_join(parks, lu.domains, by = "UNIT_CODE") # now 115 obs, 4 variables
+
+# Check for mis-matches or empty domains.
+apply(is.na(parks),2,sum) # Shows 2 domains are NA
+is.na(parks$DOMAIN) # shows rows 29, 75
+parks[c(29,75),]
+parks$DOMAIN[29] <- "EBLA" # Weirdly got dropped; EBLA=EBLA in orig NPS lookup
+parks$READY[29] <- "YES" # There's only 1 projection for EBLA -- good to go in loop.
+parks$DOMAIN[75] <- "NCAP" # NACC in DC so assigning to NCAP; not in orig NPS lookup
+parks$READY[75] <- "NO" # Multiple projections for NCAP -- not good to go in loop.
+apply(is.na(parks),2,sum) # Clear!
+
+```
+
+```{r CREATE REFERENCE LISTS}
+
+# Pull names from SLR .gdb
+layer.list <- ogrListLayers(slr.db) # N.b., this is a vector, not R-style list; doesn't pull rasters.
+
+# Won't be using any RCP 4.5 projections
+layers.rcp45 <- grep(pattern = "45", x = layer.list) # Not having value=TRUE just gives index
+layer.list <- layer.list[-layers.rcp45] %>% sort(.)
+remove(layers.rcp45)
+
+# Make vectors of each type of projection (value=TRUE gives 'em); sort so names line-up
+layers.MHHW <- grep(pattern = "MHHW", x = layer.list, value = TRUE) %>% sort(.)
+layers.slr.MHHW <- grep(pattern = "slr", x = layers.MHHW, value = TRUE) %>% sort(.)
+layers.low.MHHW <- grep(pattern = "low", x = layers.MHHW, value = TRUE) %>% sort(.)
+layers.85 <- grep(pattern = "85", x = layer.list, value = TRUE) %>% sort(.)
+layers.85.2050 <- grep(pattern="2050", x=layers.85, value=TRUE) %>% sort(.)
+layers.slr.85.2050 <- grep(pattern = "slr", x = layers.85.2050, value = TRUE) %>% sort(.)
+layers.low.85.2050 <- grep(pattern = "low", x = layers.85.2050, value = TRUE) %>% sort(.)
+layers.85.2100 <- grep(pattern="2100", x=layers.85, value=TRUE) %>% sort(.)
+layers.slr.85.2100 <- grep(pattern = "slr", x = layers.85.2100, value = TRUE) %>% sort(.)
+layers.low.85.2100 <- grep(pattern = "low", x = layers.85.2100, value = TRUE) %>% sort(.)
+remove(layers.MHHW, layers.85, layers.85.2050, layers.85.2100)
+
+df.parks <- parks ; st_geometry(df.parks) <- NULL
+```
+
+```{r SPECIAL TREATMENT PARKS}
+
+Below is specially tailored code for EACH park (1 per chunk) that has funky domain -- either funky because of 2 versions (e.g., ACAD, ACAD2) or funky b/c some of shapefiles have zero features (e.g., if no area inundated). Shapefiles for each park will be created and these results will print to a funky.results.csv. For full commenting of the code, see original loop code.
+
+Weirdos
+# These are in slr.MHHW but not in low.MHHW
+# V1  V2   V3
+# 1   ASTau slr MHHW - own code below
+# 2 CAChan2 slr MHHW - own code below
+# 3 DRTO10m slr MHHW - own code below
+
+# No records are in low.MHHW but not in slr.MHHW
+# BUT!! EVER10 has neither - own below
+
+# These are in slr.85.2050 but not in low.85.2050:
+# V1  V2 V3   V4
+# 1   ASTau slr 85 2050 - own code below
+# 2 CAChan2 slr 85 2050 - own code below
+# 3 DRTO10m slr 85 2050 - own code below
+
+# This is in low.85.2050 but not in slr.85.2050:
+# V1  V2 V3   V4
+# 1 JELA2 low 85 205 <-- JELA2 low (no slr) for 45&85 x 2050&2100 do not overlap with park; excluding from analyses
+
+# These are all the projection domain codes that don't have a matching one in the parks database.
+# ... and don't forget that the [DOMAIN]2 ones also have an associated [DOMAIN] which is incomplete.
+# 116      <NA>   ACAD2   ACAD2  slr   85 2050 - MISSING low.mhhw double loop
+# 117      <NA>   ASOfu   ASOfu  slr   85 2050 - own code below
+# 118      <NA>   ASTau   ASTau  slr   85 2050 - own code below
+# 119      <NA>  ASTutu  ASTutu  slr   85 2050 - own code below
+# 120      <NA>   ASIS2   ASIS2  slr   85 2050 - double loop
+# 121      <NA>  CAChan  CAChan  slr   85 2050 - own code below
+# 122      <NA> CAChan2 CAChan2  slr   85 2050 - own code below
+# 123      <NA> DRTO10m DRTO10m  slr   85 2050 - own below
+# 124      <NA>  DRTO5m  DRTO5m  slr   85 2050 - own below
+# 125      <NA> EVER10m EVER10m  slr   85 2050 - own below
+# 126      <NA>  EVER5m  EVER5m  slr   85 2050 - own below
+# 127      <NA>   FOVA2   FOVA2  slr   85 2050 - MISSING low.mhhw double loop
+# 128      <NA>   GATE2   GATE2  slr   85 2050 - double loop
+# 129      <NA>    Guam    Guam  slr   85 2050 - own below
+# 130      <NA>   GUIS2   GUIS2  slr   85 2050 - double loop
+# 131      <NA>    HIHw    HIHw  slr   85 2050 - own below
+# 132      <NA>  HIMaui  HIMaui  slr   85 2050 - own below
+# 133      <NA>  HIMolo  HIMolo  slr   85 2050 - own below
+# 134      <NA>  HIOahu  HIOahu  slr   85 2050 - own below
+# 135      <NA>   LEWI2   LEWI2  slr   85 2050 - double loop
+# 136      <NA>   NCAP2   NCAP2  slr   85 2050 - triple loop
+# 137      <NA>   NCAP3   NCAP3  slr   85 2050 - triple loop
+# 138      <NA>   PAIS2   PAIS2  slr   85 2050 - double loop
+# 139      <NA>   SNFR2   SNFR2  slr   85 2050 - double loop
+
+# These are all the layers that have ZERO features
+# 6  	ACAD2_low_MHHW - MISSING low.mhhw double loop
+# 44	CA_Chan_low_85_2050 - own code below
+# 45	CA_Chan_low_MHHW - own code below
+# 50	CABR_low_85_2050 - own code below
+# 51	CABR_low_MHHW - own code below
+# 116	FOVA2_low_MHHW - MISSING low.mhhw double loop
+# 188	LACL_low_85_2050 - own code below
+# 249	SITK_low_85_2050 - own code below
+# 250	SITK_low_MHHW - own code below
+
+# JELA, EVER5 are have 10000s polygons. KHWK, FOFR, HATU, CACO are huge, too.
+# I've run the latter through the loop (hrs) but JELA & EVER will be rasterized...
+
+# CUIS shapefiles have a z dimension - own code below to delete this 
+
+```
+
+```{r PREP -- RUN EACH TIME!!}
+
+st_erase = function(x, y) st_difference(x, st_union(st_combine(y)))
+
+# Create repository list for area computation; list good if length unknown.
+list.park.name <- list()
+list.park.area <- list()
+list.park.area.85.2050 <- list()
+
+# Output folder for shapefiles
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln/GIS/NPS/SLR/SLR_Compute")
+
+```
+
+```{r DOUBLES LOOP}
+
+# Establishes seed for doubled domains & 5m/10m with otherwise normal names...
+# ... and checked for non-zero geometries (ACAD2 & FOVA2 are out)
+# For example, GUIS & GUIS2 but NOT CaChan & CaChan2
+dbl.loop.ready <- grep(pattern = "ASIS", x = parks$DOMAIN) %>%
+append(grep(pattern = "GATE", x = parks$DOMAIN)) %>%
+append(grep(pattern = "GUIS", x = parks$DOMAIN)) %>%
+append(grep(pattern = "LEWI", x = parks$DOMAIN)) %>%
+append(grep(pattern = "PAIS", x = parks$DOMAIN)) %>%
+append(grep(pattern = "SNFR", x = parks$DOMAIN))
+
+
+remove(i)
+for(i in dbl.loop.ready){ 
+
+start <- Sys.time()
+    
+# Find the domain associated with the first park (substr finds characters btwn start/stop)
+temp <- substr(parks$DOMAIN[i], start=1, stop=4)
+
+# Find the associated MHHW projections -- first and second versions
+low.MHHW.name.1 <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[1]
+low.MHHW.name.2 <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[2]
+slr.MHHW.name.1 <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[1]
+slr.MHHW.name.2 <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[2]
+
+# Read in associated MHHW shapefiles; set projection to match parks
+low.MHHW.poly.1 <- st_read(slr.db, low.MHHW.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+low.MHHW.poly.2 <- st_read(slr.db, low.MHHW.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.MHHW.poly.1 <- st_read(slr.db, slr.MHHW.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0) 
+slr.MHHW.poly.2 <- st_read(slr.db, slr.MHHW.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+# Create baseline park: erase 1) low-lying (flooded land) and...
+# ...2) intersection of slr.MHHW & park to get flooded land.
+park.MHHW <- st_erase(parks[i,], low.MHHW.poly.1) %>%
+  st_erase(low.MHHW.poly.2) %>%
+  st_erase(slr.MHHW.poly.1) %>%
+  st_erase(slr.MHHW.poly.2)
+
+# Find associated 2050 SLR projections (includes coastal SLR & low-lying areas)
+low.85.2050.name.1 <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[1]
+low.85.2050.name.2 <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[2]
+slr.85.2050.name.1 <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[1]
+slr.85.2050.name.2 <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[2]
+
+# Read in associated SLR shapefiles; set projection to match parks
+low.85.2050.poly.1 <- st_read(slr.db, low.85.2050.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+low.85.2050.poly.2 <- st_read(slr.db, low.85.2050.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.85.2050.poly.1 <- st_read(slr.db, slr.85.2050.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.85.2050.poly.2 <- st_read(slr.db, slr.85.2050.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+# Create future park: erase low-lying areas & land lost to SLR
+park.85.2050 <- st_erase(park.MHHW, low.85.2050.poly.1) %>%
+  st_erase(low.85.2050.poly.2) %>%
+  st_erase(slr.85.2050.poly.1) %>%
+  st_erase(slr.85.2050.poly.2)
+
+# Compute areas and write to lists
+list.park.name[[i]] <- parks$UNIT_CODE[i]
+list.park.area[[i]] <- round(as.numeric(st_area(park.MHHW)),2)
+list.park.area.85.2050[[i]] <- round(as.numeric(st_area(park.85.2050)),2)
+
+# Output folder for shapefiles
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln/GIS/NPS/SLR/SLR_Compute")
+# Write as new shapefile in directory SLR_Compute
+st_write(park.MHHW, paste0(parks$UNIT_CODE[i],"_baseline.shp"))
+st_write(park.85.2050, paste0(parks$UNIT_CODE[i],"_slr.85.2050.shp"))
+# Reset wd
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln")
+
+print(paste0("Done with park ", parks$UNIT_CODE[i], "."))
+print(Sys.time() - start)
+}
+
+```
+
+```{r ACAD & FOVA}
+# ACAD2 & FOVA2 missing low MHHW
+
+ready <- grep(pattern = "ACAD", x = parks$DOMAIN) %>%
+append(grep(pattern = "FOVA", x = parks$DOMAIN))
+
+remove(i)
+for(i in ready){ 
+
+start <- Sys.time()
+
+# Find the domain associated with the first park (substr finds characters btwn start/stop)
+temp <- substr(parks$DOMAIN[i], start=1, stop=4)
+
+# Find the associated MHHW projections -- first and second versions
+low.MHHW.name.1 <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[1]
+# low.MHHW.name.2 <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[2]
+slr.MHHW.name.1 <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[1]
+slr.MHHW.name.2 <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[2]
+
+# Read in associated MHHW shapefiles; set projection to match parks
+low.MHHW.poly.1 <- st_read(slr.db, low.MHHW.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+# low.MHHW.poly.2 <- st_read(slr.db, low.MHHW.name.2) %>%
+#   st_transform(st_crs(parks)) %>%
+#   st_buffer(dist = 0)
+slr.MHHW.poly.1 <- st_read(slr.db, slr.MHHW.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0) 
+slr.MHHW.poly.2 <- st_read(slr.db, slr.MHHW.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+# Create baseline park: erase 1) low-lying (flooded land) and...
+# ...2) intersection of slr.MHHW & park to get flooded land.
+park.MHHW <- st_erase(parks[i,], low.MHHW.poly.1) %>%
+  # st_erase(low.MHHW.poly.2) %>%
+  st_erase(slr.MHHW.poly.1) %>%
+  st_erase(slr.MHHW.poly.2)
+
+# Find associated 2050 SLR projections (includes coastal SLR & low-lying areas)
+low.85.2050.name.1 <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[1]
+low.85.2050.name.2 <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[2]
+slr.85.2050.name.1 <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[1]
+slr.85.2050.name.2 <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[2]
+
+# Read in associated SLR shapefiles; set projection to match parks
+low.85.2050.poly.1 <- st_read(slr.db, low.85.2050.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+low.85.2050.poly.2 <- st_read(slr.db, low.85.2050.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.85.2050.poly.1 <- st_read(slr.db, slr.85.2050.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.85.2050.poly.2 <- st_read(slr.db, slr.85.2050.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+# Create future park: erase low-lying areas & land lost to SLR
+park.85.2050 <- st_erase(park.MHHW, low.85.2050.poly.1) %>%
+  st_erase(low.85.2050.poly.2) %>%
+  st_erase(slr.85.2050.poly.1) %>%
+  st_erase(slr.85.2050.poly.2)
+
+# Compute areas and write to lists
+list.park.name[[i]] <- parks$UNIT_CODE[i]
+list.park.area[[i]] <- round(as.numeric(st_area(park.MHHW)),2)
+list.park.area.85.2050[[i]] <- round(as.numeric(st_area(park.85.2050)),2)
+
+# Write as new shapefile in directory SLR_Compute
+st_write(park.MHHW, paste0(parks$UNIT_CODE[i],"_baseline.shp"))
+st_write(park.85.2050, paste0(parks$UNIT_CODE[i],"_slr.85.2050.shp"))
+
+print(paste0("Done with park ", parks$UNIT_CODE[i], "."))
+print(Sys.time() - start)
+}
+
+
+```
+
+```{r AMERICAN SOMOA}
+# All projections with prefix AS_ correspond to American Somoa.
+# UNIT CODE = NPSA, DOMAIN = NPSA in parks database
+# 117      <NA>   ASOfu
+# 118      <NA>   ASTau
+# 119      <NA>  ASTutu\
+# AS_Tau does NOT have low layers
+ready <- grep(pattern = "NPSA", x = parks$DOMAIN)
+
+remove(i)
+for(i in ready){ 
+start <- Sys.time()
+temp <- "AS_"
+
+# Find the associated MHHW projections -- first and second versions
+low.MHHW.name.1 <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[1]
+low.MHHW.name.2 <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[2]
+# low.MHHW.name.3 <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[3]
+slr.MHHW.name.1 <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[1]
+slr.MHHW.name.2 <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[2]
+slr.MHHW.name.3 <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[3]
+
+# Read in associated MHHW shapefiles; set projection to match parks
+low.MHHW.poly.1 <- st_read(slr.db, low.MHHW.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+low.MHHW.poly.2 <- st_read(slr.db, low.MHHW.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+# low.MHHW.poly.3 <- st_read(slr.db, low.MHHW.name.3) %>%
+#   st_transform(st_crs(parks)) %>%
+#   st_buffer(dist = 0)
+slr.MHHW.poly.1 <- st_read(slr.db, slr.MHHW.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0) 
+slr.MHHW.poly.2 <- st_read(slr.db, slr.MHHW.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.MHHW.poly.3 <- st_read(slr.db, slr.MHHW.name.3) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+# Create baseline park: erase 1) low-lying (flooded land) and...
+# ...2) intersection of slr.MHHW & park to get flooded land.
+park.MHHW <- st_erase(parks[i,], low.MHHW.poly.1) %>%
+  st_erase(low.MHHW.poly.2) %>%
+  # st_erase(low.MHHW.poly.3) %>%
+  st_erase(slr.MHHW.poly.1) %>%
+  st_erase(slr.MHHW.poly.2) %>%
+  st_erase(slr.MHHW.poly.3)
+
+# Find associated 2050 SLR projections (includes coastal SLR & low-lying areas)
+low.85.2050.name.1 <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[1]
+low.85.2050.name.2 <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[2]
+# low.85.2050.name.3 <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[3]
+slr.85.2050.name.1 <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[1]
+slr.85.2050.name.2 <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[2]
+slr.85.2050.name.3 <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[3]
+
+# Read in associated SLR shapefiles; set projection to match parks
+low.85.2050.poly.1 <- st_read(slr.db, low.85.2050.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+low.85.2050.poly.2 <- st_read(slr.db, low.85.2050.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+# low.85.2050.poly.3 <- st_read(slr.db, low.85.2050.name.3) %>%
+#   st_transform(st_crs(parks)) %>%
+#   st_buffer(dist = 0)
+slr.85.2050.poly.1 <- st_read(slr.db, slr.85.2050.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.85.2050.poly.2 <- st_read(slr.db, slr.85.2050.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.85.2050.poly.3 <- st_read(slr.db, slr.85.2050.name.3) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+# Create future park: erase low-lying areas & land lost to SLR
+park.85.2050 <- st_erase(park.MHHW, low.85.2050.poly.1) %>%
+  st_erase(low.85.2050.poly.2) %>%
+  # st_erase(low.85.2050.poly.3) %>%
+  st_erase(slr.85.2050.poly.1) %>%
+  st_erase(slr.85.2050.poly.3) %>%
+  st_erase(slr.85.2050.poly.2)
+
+# Compute areas and write to lists
+list.park.name[[i]] <- parks$UNIT_CODE[i]
+list.park.area[[i]] <- round(as.numeric(st_area(park.MHHW)),2)
+list.park.area.85.2050[[i]] <- round(as.numeric(st_area(park.85.2050)),2)
+
+# Write as new shapefile in directory SLR_Compute
+st_write(park.MHHW, paste0(parks$UNIT_CODE[i],"_baseline.shp"))
+st_write(park.85.2050, paste0(parks$UNIT_CODE[i],"_slr.85.2050.shp"))
+
+print(paste0("Done with park ", parks$UNIT_CODE[i], "."))
+print(Sys.time() - start)
+}
+```
+
+```{r CABR & SITK} 
+# missing:
+# 50	CABR_low_85_2050
+# 51	CABR_low_MHHW
+# 249	SITK_low_85_2050
+# 250	SITK_low_MHHW#
+
+ready <- grep(pattern = "CABR", x = parks$DOMAIN) %>%
+append(grep(pattern = "SITK", x = parks$DOMAIN))
+remove(i)
+
+for(i in ready){ 
+start <- Sys.time()
+temp <- substr(parks$DOMAIN[i], start=1, stop=4)
+slr.MHHW.name <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[1]
+slr.MHHW.poly <- st_read(slr.db, slr.MHHW.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+park.MHHW <- st_erase(parks[i,], slr.MHHW.poly) 
+slr.85.2050.name <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[1]
+slr.85.2050.poly <- st_read(slr.db, slr.85.2050.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+park.85.2050 <- st_erase(park.MHHW, slr.85.2050.poly)
+list.park.name[[i]] <- parks$UNIT_CODE[i]
+list.park.area[[i]] <- round(as.numeric(st_area(park.MHHW)),2)
+list.park.area.85.2050[[i]] <- round(as.numeric(st_area(park.85.2050)),2)
+
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln/GIS/NPS/SLR/SLR_Compute")
+st_write(park.MHHW, paste0(parks$UNIT_CODE[i],"_baseline.shp"))
+st_write(park.85.2050, paste0(parks$UNIT_CODE[i],"_slr.85.2050.shp"))
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln")
+
+print(paste0("Done with park ", parks$UNIT_CODE[i], "."))
+print(Sys.time() - start)
+}
+
+```
+
+```{r CUIS} 
+# missing:
+# apparently has a z dimension?
+
+ready <- grep(pattern = "CUIS", x = parks$DOMAIN)
+remove(i)
+
+for(i in ready){ 
+start <- Sys.time()
+temp <- substr(parks$DOMAIN[i], start=1, stop=4)
+
+# Find the associated MHHW projections.
+low.MHHW.name <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[1]
+slr.MHHW.name <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[1]
+
+# Read in associated MHHW shapefiles; set projection to match parks
+low.MHHW.poly <- st_read(slr.db, low.MHHW.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0) # fix invalid geometries (warning re: lat/long vs. dd)
+slr.MHHW.poly <- st_read(slr.db, slr.MHHW.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0) # fix invalid geometries (warning re: lat/long vs. dd)
+
+# Create baseline park: erase 1) low-lying (flooded land) and...
+# ...2) intersection of slr.MHHW & park to get flooded land.
+park.MHHW <- st_erase(parks[i,], low.MHHW.poly) %>%
+  st_erase(slr.MHHW.poly)
+
+# Find associated 2050 SLR projections (includes coastal SLR & low-lying areas)
+low.85.2050.name <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[1]
+slr.85.2050.name <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[1]
+
+# Read in associated SLR shapefiles; set projection to match parks
+low.85.2050.poly <- st_read(slr.db, low.85.2050.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0) # fix invalid geometries (warning re: lat/long vs. dd)
+slr.85.2050.poly <- st_read(slr.db, slr.85.2050.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0) # fix invalid geometries (warning re: lat/long vs. dd)
+
+# Create future park: erase low-lying areas & land lost to SLR
+park.85.2050 <- st_erase(park.MHHW, low.85.2050.poly) %>%
+  st_erase(slr.85.2050.poly)
+
+# Remove Z geometry else error in area computation below
+park.MHHW <- st_zm(park.MHHW, drop = TRUE, what = "ZM")
+park.85.2050 <- st_zm(park.85.2050, drop = TRUE, what = "ZM")
+
+# Compute areas and write to lists
+list.park.name[[i]] <- parks$UNIT_CODE[i]
+list.park.area[[i]] <- round(as.numeric(st_area(park.MHHW)),2)
+list.park.area.85.2050[[i]] <- round(as.numeric(st_area(park.85.2050)),2)
+
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln/GIS/NPS/SLR/SLR_Compute")
+st_write(park.MHHW, paste0(parks$UNIT_CODE[i],"_baseline.shp"))
+st_write(park.85.2050, paste0(parks$UNIT_CODE[i],"_slr.85.2050.shp"))
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln")
+
+print(paste0("Done with park ", parks$UNIT_CODE[i], "."))
+print(Sys.time() - start)
+}
+```
+
+```{r CaChan & CaChan2}
+# Layers that have ZERO features
+# 44	CA_Chan_low_85_2050
+# 45	CA_Chan_low_MHHW
+# Missing
+# 2 CAChan2 low MHHW
+# 2 CAChan2 low 85 2050
+# So, no lows.
+# Corresponds to park CHIS (Channel Islands)
+
+# Unit code & domain name for Guam is WAPA, but projections have Guam as prefix.
+ready <- grep(pattern = "CHIS", x = parks$DOMAIN)
+remove(i)
+
+for(i in ready){ 
+start <- Sys.time()
+temp <- "CA_Chan"
+
+# Find the associated MHHW projections -- first and second versions
+slr.MHHW.name.1 <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[1]
+slr.MHHW.name.2 <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[2]
+
+# Read in associated MHHW shapefiles; set projection to match parks
+slr.MHHW.poly.1 <- st_read(slr.db, slr.MHHW.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.MHHW.poly.2 <- st_read(slr.db, slr.MHHW.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+# Create baseline park: erase 1) low-lying (flooded land) and...
+# ...2) intersection of slr.MHHW & park to get flooded land.
+park.MHHW <- st_erase(parks[i,], slr.MHHW.poly.1) %>%
+  st_erase(slr.MHHW.poly.2)
+
+# Find associated 2050 SLR projections (includes coastal SLR & low-lying areas)
+slr.85.2050.name.1 <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[1]
+slr.85.2050.name.2 <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[2]
+
+# Read in associated SLR shapefiles; set projection to match parks
+slr.85.2050.poly.1 <- st_read(slr.db, slr.85.2050.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.85.2050.poly.2 <- st_read(slr.db, slr.85.2050.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+# Create future park: erase low-lying areas & land lost to SLR
+park.85.2050 <- st_erase(park.MHHW, slr.85.2050.poly.1) %>%
+  st_erase(slr.85.2050.poly.2)
+
+# Compute areas and write to lists
+list.park.name[[i]] <- parks$UNIT_CODE[i]
+list.park.area[[i]] <- round(as.numeric(st_area(park.MHHW)),2)
+list.park.area.85.2050[[i]] <- round(as.numeric(st_area(park.85.2050)),2)
+
+# Write as new shapefile in directory SLR_Compute
+st_write(park.MHHW, paste0(parks$UNIT_CODE[i],"_baseline.shp"))
+st_write(park.85.2050, paste0(parks$UNIT_CODE[i],"_slr.85.2050.shp"))
+
+print(paste0("Done with park ", parks$UNIT_CODE[i], "."))
+print(Sys.time() - start)
+}
+
+```
+
+```{r DRTO5m & DRTO10m}
+# Missing 10m lows
+
+ready <- grep(pattern = "DRTO", x = parks$DOMAIN) 
+
+remove(i)
+for(i in ready){ 
+
+start <- Sys.time()
+
+# Find the domain associated with the first park (substr finds characters btwn start/stop)
+temp <- substr(parks$DOMAIN[i], start=1, stop=4)
+
+# Find the associated MHHW projections -- first and second versions
+low.MHHW.name.1 <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[1]
+# low.MHHW.name.2 <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[2] only 5m exists
+slr.MHHW.name.1 <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[1]
+slr.MHHW.name.2 <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[2]
+
+# Read in associated MHHW shapefiles; set projection to match parks
+low.MHHW.poly.1 <- st_read(slr.db, low.MHHW.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+# low.MHHW.poly.2 <- st_read(slr.db, low.MHHW.name.2) %>%
+#   st_transform(st_crs(parks)) %>%
+#   st_buffer(dist = 0)
+slr.MHHW.poly.1 <- st_read(slr.db, slr.MHHW.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.MHHW.poly.2 <- st_read(slr.db, slr.MHHW.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+# Create baseline park: erase 1) low-lying (flooded land) and...
+# ...2) intersection of slr.MHHW & park to get flooded land.
+park.MHHW <- st_erase(parks[i,], low.MHHW.poly.1) %>%
+  # st_erase(low.MHHW.poly.2) %>%
+  st_erase(slr.MHHW.poly.1) %>%
+  st_erase(slr.MHHW.poly.2)
+
+# Find associated 2050 SLR projections (includes coastal SLR & low-lying areas)
+low.85.2050.name.1 <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[1]
+# low.85.2050.name.2 <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[2]
+slr.85.2050.name.1 <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[1]
+slr.85.2050.name.2 <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[2]
+
+# Read in associated SLR shapefiles; set projection to match parks
+low.85.2050.poly.1 <- st_read(slr.db, low.85.2050.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+# low.85.2050.poly.2 <- st_read(slr.db, low.85.2050.name.2) %>%
+#   st_transform(st_crs(parks)) %>%
+#   st_buffer(dist = 0)
+slr.85.2050.poly.1 <- st_read(slr.db, slr.85.2050.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.85.2050.poly.2 <- st_read(slr.db, slr.85.2050.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+# Create future park: erase low-lying areas & land lost to SLR
+park.85.2050 <- st_erase(park.MHHW, low.85.2050.poly.1) %>%
+  # st_erase(low.85.2050.poly.2) %>%
+  st_erase(slr.85.2050.poly.1) %>%
+  st_erase(slr.85.2050.poly.2)
+
+# Compute areas and write to lists
+list.park.name[[i]] <- parks$UNIT_CODE[i]
+list.park.area[[i]] <- round(as.numeric(st_area(park.MHHW)),2)
+list.park.area.85.2050[[i]] <- round(as.numeric(st_area(park.85.2050)),2)
+
+# Write as new shapefile in directory SLR_Compute
+st_write(park.MHHW, paste0(parks$UNIT_CODE[i],"_baseline.shp"))
+st_write(park.85.2050, paste0(parks$UNIT_CODE[i],"_slr.85.2050.shp"))
+
+print(paste0("Done with park ", parks$UNIT_CODE[i], "."))
+print(Sys.time() - start)
+}
+
+
+```
+
+```{r EVER5m & EVER10m}
+# 10m has neither MHHW & there are LOTSA features. 
+# OPEN & RUN SLR_StormSurge_EVER-RASTER_171013.R
+
+```
+
+```{r GUAM}
+# Unit code & domain name for Guam is WAPA, but projections have Guam as prefix.
+ready <- grep(pattern = "WAPA", x = parks$DOMAIN)
+remove(i)
+
+for(i in ready){ 
+start <- Sys.time()
+temp <- "Guam"
+
+# Find the associated MHHW projections.
+low.MHHW.name <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[1] # only keep the first instance of match
+slr.MHHW.name <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[1]
+
+# Read in associated MHHW shapefiles; set projection to match parks
+low.MHHW.poly <- st_read(slr.db, low.MHHW.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0) # fix invalid geometries (warning re: lat/long vs. dd)
+slr.MHHW.poly <- st_read(slr.db, slr.MHHW.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0) # fix invalid geometries (warning re: lat/long vs. dd)
+
+# Create baseline park: erase 1) low-lying (flooded land) and...
+# ...2) intersection of slr.MHHW & park to get flooded land.
+park.MHHW <- st_erase(parks[i,], low.MHHW.poly) %>%
+  st_erase(slr.MHHW.poly)
+
+# Find associated 2050 SLR projections (includes coastal SLR & low-lying areas)
+low.85.2050.name <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[1]
+slr.85.2050.name <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[1]
+
+# Read in associated SLR shapefiles; set projection to match parks
+low.85.2050.poly <- st_read(slr.db, low.85.2050.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0) # fix invalid geometries (warning re: lat/long vs. dd)
+slr.85.2050.poly <- st_read(slr.db, slr.85.2050.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0) # fix invalid geometries (warning re: lat/long vs. dd)
+
+# Create future park: erase low-lying areas & land lost to SLR
+park.85.2050 <- st_erase(park.MHHW, low.85.2050.poly) %>%
+  st_erase(slr.85.2050.poly)
+
+# Compute areas and write to lists
+list.park.name[[i]] <- parks$UNIT_CODE[i]
+list.park.area[[i]] <- round(as.numeric(st_area(park.MHHW)),2)
+list.park.area.85.2050[[i]] <- round(as.numeric(st_area(park.85.2050)),2)
+
+# Output folder if I generate shapefiles
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln/GIS/NPS/SLR/SLR_Compute")
+# Write as new shapefile in directory SLR_Compute
+st_write(park.MHHW, paste0(parks$UNIT_CODE[i],"_baseline.shp"))
+st_write(park.85.2050, paste0(parks$UNIT_CODE[i],"_slr.85.2050.shp"))
+# Reset wd
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln")
+
+print(paste0("Done with park ", parks$UNIT_CODE[i], "."))
+print(Sys.time() - start)
+}
+
+```
+
+```{r JELA}
+# LOTSA features.
+# OPEN & RUN SLR_StormSurge_JELA-RASTER_171012.R
+
+```
+
+```{r HI_Hw}
+# DOMAIN    PARK    PROJECTION PREFIX
+# HAWA      HAVO    HI_Hw
+# HAWA      PUHE    HI_Hw
+# HAWA      KAHO    HI_Hw
+# HAWA      PUHO    HI_Hw
+# Domain in parks database is HAWA, but projections prefix diff.
+ready <- grep(pattern = "HAWA", x = parks$DOMAIN)
+remove(i)
+
+for(i in ready){
+start <- Sys.time()
+temp <- "HI_Hw"
+
+low.MHHW.name <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[1]
+slr.MHHW.name <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[1]
+
+low.MHHW.poly <- st_read(slr.db, low.MHHW.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.MHHW.poly <- st_read(slr.db, slr.MHHW.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+park.MHHW <- st_erase(parks[i,], low.MHHW.poly) %>%
+  st_erase(slr.MHHW.poly)
+
+low.85.2050.name <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[1]
+slr.85.2050.name <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[1]
+
+low.85.2050.poly <- st_read(slr.db, low.85.2050.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.85.2050.poly <- st_read(slr.db, slr.85.2050.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+park.85.2050 <- st_erase(park.MHHW, low.85.2050.poly) %>%
+  st_erase(slr.85.2050.poly)
+
+list.park.name[[i]] <- parks$UNIT_CODE[i]
+list.park.area[[i]] <- round(as.numeric(st_area(park.MHHW)),2)
+list.park.area.85.2050[[i]] <- round(as.numeric(st_area(park.85.2050)),2)
+
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln/GIS/NPS/SLR/SLR_Compute")
+st_write(park.MHHW, paste0(parks$UNIT_CODE[i],"_baseline.shp"))
+st_write(park.85.2050, paste0(parks$UNIT_CODE[i],"_slr.85.2050.shp"))
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln")
+
+print(paste0("Done with park ", parks$UNIT_CODE[i], "."))
+print(Sys.time() - start)
+}
+
+```
+
+```{r HI_Maui}
+# DOMAIN    PARK    PROJECTION PREFIX
+# HIPK      HALE    HI_Maui
+# Domain in parks database is HIPK, but projections prefix diff.
+ready <- grep(pattern = "HIPK", x = parks$DOMAIN)
+remove(i)
+
+for(i in ready){
+start <- Sys.time()
+temp <- "HI_Maui"
+
+low.MHHW.name <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[1]
+slr.MHHW.name <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[1]
+
+low.MHHW.poly <- st_read(slr.db, low.MHHW.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.MHHW.poly <- st_read(slr.db, slr.MHHW.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+park.MHHW <- st_erase(parks[i,], low.MHHW.poly) %>%
+  st_erase(slr.MHHW.poly)
+
+low.85.2050.name <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[1]
+slr.85.2050.name <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[1]
+
+low.85.2050.poly <- st_read(slr.db, low.85.2050.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.85.2050.poly <- st_read(slr.db, slr.85.2050.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+park.85.2050 <- st_erase(park.MHHW, low.85.2050.poly) %>%
+  st_erase(slr.85.2050.poly)
+
+list.park.name[[i]] <- parks$UNIT_CODE[i]
+list.park.area[[i]] <- round(as.numeric(st_area(park.MHHW)),2)
+list.park.area.85.2050[[i]] <- round(as.numeric(st_area(park.85.2050)),2)
+
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln/GIS/NPS/SLR/SLR_Compute")
+st_write(park.MHHW, paste0(parks$UNIT_CODE[i],"_baseline.shp"))
+st_write(park.85.2050, paste0(parks$UNIT_CODE[i],"_slr.85.2050.shp"))
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln")
+
+print(paste0("Done with park ", parks$UNIT_CODE[i], "."))
+print(Sys.time() - start)
+}
+
+```
+
+```{r HI_Molo}
+# DOMAIN    PARK    PROJECTION PREFIX
+# HIPK      KALA    HI_Molo
+# Domain in parks database is HIPK, but projections prefix diff.
+ready <- grep(pattern = "HIPK", x = parks$DOMAIN)
+remove(i)
+
+for(i in ready){
+start <- Sys.time()
+temp <- "HI_Molo"
+
+low.MHHW.name <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[1]
+slr.MHHW.name <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[1]
+
+low.MHHW.poly <- st_read(slr.db, low.MHHW.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.MHHW.poly <- st_read(slr.db, slr.MHHW.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+park.MHHW <- st_erase(parks[i,], low.MHHW.poly) %>%
+  st_erase(slr.MHHW.poly)
+
+low.85.2050.name <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[1]
+slr.85.2050.name <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[1]
+
+low.85.2050.poly <- st_read(slr.db, low.85.2050.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.85.2050.poly <- st_read(slr.db, slr.85.2050.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+park.85.2050 <- st_erase(park.MHHW, low.85.2050.poly) %>%
+  st_erase(slr.85.2050.poly)
+
+list.park.name[[i]] <- parks$UNIT_CODE[i]
+list.park.area[[i]] <- round(as.numeric(st_area(park.MHHW)),2)
+list.park.area.85.2050[[i]] <- round(as.numeric(st_area(park.85.2050)),2)
+
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln/GIS/NPS/SLR/SLR_Compute")
+st_write(park.MHHW, paste0(parks$UNIT_CODE[i],"_baseline.shp"))
+st_write(park.85.2050, paste0(parks$UNIT_CODE[i],"_slr.85.2050.shp"))
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln")
+
+print(paste0("Done with park ", parks$UNIT_CODE[i], "."))
+print(Sys.time() - start)
+}
+
+```
+
+```{r HI_Oahu}
+# DOMAIN    PARK    PROJECTION PREFIX
+# HIPK      VALR    HI_Oahu
+# Domain in parks database is HIPK, but projections prefix diff.
+ready <- grep(pattern = "HIPK", x = parks$DOMAIN)
+remove(i)
+
+for(i in ready){
+start <- Sys.time()
+temp <- "HI_Oahu"
+
+low.MHHW.name <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[1]
+slr.MHHW.name <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[1]
+
+low.MHHW.poly <- st_read(slr.db, low.MHHW.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.MHHW.poly <- st_read(slr.db, slr.MHHW.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+park.MHHW <- st_erase(parks[i,], low.MHHW.poly) %>%
+  st_erase(slr.MHHW.poly)
+
+low.85.2050.name <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[1]
+slr.85.2050.name <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[1]
+
+low.85.2050.poly <- st_read(slr.db, low.85.2050.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.85.2050.poly <- st_read(slr.db, slr.85.2050.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+park.85.2050 <- st_erase(park.MHHW, low.85.2050.poly) %>%
+  st_erase(slr.85.2050.poly)
+
+list.park.name[[i]] <- parks$UNIT_CODE[i]
+list.park.area[[i]] <- round(as.numeric(st_area(park.MHHW)),2)
+list.park.area.85.2050[[i]] <- round(as.numeric(st_area(park.85.2050)),2)
+
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln/GIS/NPS/SLR/SLR_Compute")
+st_write(park.MHHW, paste0(parks$UNIT_CODE[i],"_baseline.shp"))
+st_write(park.85.2050, paste0(parks$UNIT_CODE[i],"_slr.85.2050.shp"))
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln")
+
+print(paste0("Done with park ", parks$UNIT_CODE[i], "."))
+print(Sys.time() - start)
+}
+
+```
+
+```{r LACL}
+# missing: LACL_low_85_2050
+
+ready <- grep(pattern = "LACL", x = parks$DOMAIN)
+remove(i)
+
+for(i in ready){
+start <- Sys.time()
+
+temp <- substr(parks$DOMAIN[i], start=1, stop=4)
+
+low.MHHW.name <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[1]
+slr.MHHW.name <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[1]
+
+low.MHHW.poly <- st_read(slr.db, low.MHHW.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.MHHW.poly <- st_read(slr.db, slr.MHHW.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+park.MHHW <- st_erase(parks[i,], low.MHHW.poly) %>%
+  st_erase(slr.MHHW.poly)
+
+# low.85.2050.name <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[1]
+slr.85.2050.name <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[1]
+
+# low.85.2050.poly <- st_read(slr.db, low.85.2050.name) %>%
+  # st_transform(st_crs(parks)) %>%
+  # st_buffer(dist = 0) # fix invalid geometries (warning re: lat/long vs. dd)
+slr.85.2050.poly <- st_read(slr.db, slr.85.2050.name) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0) # fix invalid geometries (warning re: lat/long vs. dd)
+
+# Create future park: erase low-lying areas & land lost to SLR
+park.85.2050 <- st_erase(park.MHHW, slr.85.2050.poly)
+
+# Compute areas and write to lists
+list.park.name[[i]] <- parks$UNIT_CODE[i]
+list.park.area[[i]] <- round(as.numeric(st_area(park.MHHW)),2)
+list.park.area.85.2050[[i]] <- round(as.numeric(st_area(park.85.2050)),2)
+
+# Output folder if I generate shapefiles
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln/GIS/NPS/SLR/SLR_Compute")
+# Write as new shapefile in directory SLR_Compute
+st_write(park.MHHW, paste0(parks$UNIT_CODE[i],"_baseline.shp"))
+st_write(park.85.2050, paste0(parks$UNIT_CODE[i],"_slr.85.2050.shp"))
+# Reset wd
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln")
+
+print(paste0("Done with park ", parks$UNIT_CODE[i], "."))
+print(Sys.time() - start)
+}
+```
+
+```{r NCAP & NCAP2 & NCAP3}
+ready <- grep(pattern = "NCAP", x = parks$DOMAIN)
+
+remove(i)
+for(i in ready){
+
+start <- Sys.time()
+
+temp <- substr(parks$DOMAIN[i], start=1, stop=4)
+
+# Find the associated MHHW projections -- first and second versions
+low.MHHW.name.1 <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[1]
+low.MHHW.name.2 <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[2]
+low.MHHW.name.3 <- grep(pattern=temp, x=layers.low.MHHW, value=TRUE)[3]
+slr.MHHW.name.1 <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[1]
+slr.MHHW.name.2 <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[2]
+slr.MHHW.name.3 <- grep(pattern=temp, x=layers.slr.MHHW, value=TRUE)[3]
+
+# Read in associated MHHW shapefiles; set projection to match parks
+low.MHHW.poly.1 <- st_read(slr.db, low.MHHW.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+low.MHHW.poly.2 <- st_read(slr.db, low.MHHW.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+low.MHHW.poly.3 <- st_read(slr.db, low.MHHW.name.3) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.MHHW.poly.1 <- st_read(slr.db, slr.MHHW.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.MHHW.poly.2 <- st_read(slr.db, slr.MHHW.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.MHHW.poly.3 <- st_read(slr.db, slr.MHHW.name.3) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+# Create baseline park: erase 1) low-lying (flooded land) and...
+# ...2) intersection of slr.MHHW & park to get flooded land.
+park.MHHW <- st_erase(parks[i,], low.MHHW.poly.1) %>%
+  st_erase(low.MHHW.poly.2) %>%
+  st_erase(low.MHHW.poly.3) %>%
+  st_erase(slr.MHHW.poly.1) %>%
+  st_erase(slr.MHHW.poly.2) %>%
+  st_erase(slr.MHHW.poly.3)
+
+# Find associated 2050 SLR projections (includes coastal SLR & low-lying areas)
+low.85.2050.name.1 <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[1]
+low.85.2050.name.2 <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[2]
+low.85.2050.name.3 <- grep(pattern=temp, x=layers.low.85.2050, value=TRUE)[3]
+slr.85.2050.name.1 <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[1]
+slr.85.2050.name.2 <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[2]
+slr.85.2050.name.3 <- grep(pattern=temp, x=layers.slr.85.2050, value=TRUE)[3]
+
+# Read in associated SLR shapefiles; set projection to match parks
+low.85.2050.poly.1 <- st_read(slr.db, low.85.2050.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+low.85.2050.poly.2 <- st_read(slr.db, low.85.2050.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+low.85.2050.poly.3 <- st_read(slr.db, low.85.2050.name.3) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.85.2050.poly.1 <- st_read(slr.db, slr.85.2050.name.1) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.85.2050.poly.2 <- st_read(slr.db, slr.85.2050.name.2) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+slr.85.2050.poly.3 <- st_read(slr.db, slr.85.2050.name.3) %>%
+  st_transform(st_crs(parks)) %>%
+  st_buffer(dist = 0)
+
+# Create future park: erase low-lying areas & land lost to SLR
+park.85.2050 <- st_erase(park.MHHW, low.85.2050.poly.1) %>%
+  st_erase(low.85.2050.poly.2) %>%
+  st_erase(low.85.2050.poly.3) %>%
+  st_erase(slr.85.2050.poly.1) %>%
+  st_erase(slr.85.2050.poly.3) %>%
+  st_erase(slr.85.2050.poly.2)
+
+# Compute areas and write to lists
+list.park.name[[i]] <- parks$UNIT_CODE[i]
+list.park.area[[i]] <- round(as.numeric(st_area(park.MHHW)),2)
+list.park.area.85.2050[[i]] <- round(as.numeric(st_area(park.85.2050)),2)
+
+# Write as new shapefile in directory SLR_Compute
+st_write(park.MHHW, paste0(parks$UNIT_CODE[i],"_baseline.shp"))
+st_write(park.85.2050, paste0(parks$UNIT_CODE[i],"_slr.85.2050.shp"))
+
+print(paste0("Done with park ", parks$UNIT_CODE[i], "."))
+print(Sys.time() - start)
+}
+```
+
+```{r TIDY IT ALL UP}
+# Remove unnecessary thangs
+remove(slr.MHHW.name.1, low.MHHW.name.1, slr.MHHW.name.2, low.MHHW.name.2, slr.MHHW.name.3, low.MHHW.name.3,
+       slr.MHHW.poly.1, low.MHHW.poly.1, slr.MHHW.poly.2, low.MHHW.poly.2, slr.MHHW.poly.3, low.MHHW.poly.3,
+       slr.85.2050.name.1, low.85.2050.name.1, slr.85.2050.name.2, low.85.2050.name.2, slr.85.2050.name.3, low.85.2050.name.3,
+       slr.85.2050.poly.1, low.85.2050.poly.1, slr.85.2050.poly.2, low.85.2050.poly.2, slr.85.2050.poly.3, low.85.2050.poly.3,
+       slr.MHHW.name, low.MHHW.name,
+       slr.MHHW.poly, low.MHHW.poly,
+       slr.85.2050.name, low.85.2050.name,
+       slr.85.2050.poly, low.85.2050.poly,
+       park.MHHW, park.85.2050, temp, i, start, ready)
+```
+
+```{r RESULTS TABLE}
+
+# Set any NULLS in list to NA so they don't disappear
+list.park.name <- sapply(list.park.name, function(x) ifelse(x == "NULL", NA, x))
+list.park.area <- sapply(list.park.area, function(x) ifelse(x == "NULL", NA, x))
+list.park.area.85.2050 <- lapply(list.park.area.85.2050, function(x) ifelse(x == "NULL", NA, x))
+
+# Turn them into matrices; dunno what this does. t tranposes.
+library(plyr)
+mat1 <- (plyr::rbind.fill.matrix(lapply(list.park.name, t)))
+mat2 <- (plyr::rbind.fill.matrix(lapply(list.park.area, t)))
+mat3 <- (plyr::rbind.fill.matrix(lapply(list.park.area.85.2050, t)))
+# Alt below. Avoiding b/c some lists may have more/less NULLS...
+#... based on data availability. Don't want to collapse to diff sizes.
+# mat1 <- do.call("rbind",list.park.name) # do.call asks for LIST of arguments
+# mat2 <- do.call("rbind",list.park.area)
+# mat3  <- do.call("rbind",list.park.area.85.2050)
+df.results <- data.frame(cbind(mat1, mat2, mat3)) ; remove(mat1, mat2, mat3)
+df.results[,2] <- as.numeric(as.character(df.results[,2]))
+df.results[,3] <- as.numeric(as.character(df.results[,3]))
+
+df.results <- df.results %>%
+  dplyr::rename_(UNIT_CODE = names(.)[1], # Dunno why rename_; but rename won't work
+                area.m2 = names(.)[2],
+                area.85.2050.m2 = names(.)[3]) %>%
+  mutate(area.slr.loss.m2 = (area.m2 - area.85.2050.m2)) %>%
+  mutate(area.slr.loss.perc = (area.slr.loss.m2 / area.m2))
+
+
+# Write results to csv
+currentDate <- Sys.Date()
+csvFileName <- paste0("weirdo_results1_",currentDate,".csv")
+write.csv(df.results, paste0("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln/GIS/NPS/SLR/SLR_Compute/",csvFileName))
+
+
+remove(currentDate, csvFileName)
+
+```

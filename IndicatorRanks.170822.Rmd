@@ -1,0 +1,402 @@
+---
+title: "IndicatorRanks"
+author: "CaitLittlef"
+date: "August 15, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r setup}
+setwd("//main.sefs.uw.edu/main/Space/Lawler/Shared/Julia/NPVuln/Indicator_Dir")
+wd <- getwd()
+install.packages("readr")
+install.packages("plyr")
+install.packages("dplyr") 
+install.packages("tidyr")
+install.packages("vegan")
+
+library(readr)
+#library(plyr) # n.b., some functions (e.g., rename) operate diff with plyr & dplyr
+library(dplyr)
+library(tidyr)
+
+# N.b., I could use this if all .csv were in directory :/
+# temp = list.files(pattern = "*.csv")
+# for (i in 1:length(temp)) assign(temp[i], read.csv(temp[i]))
+
+```
+
+############################################
+## NPS UNIT SUMMARIES & AREA REASSIGNMENT ##
+############################################
+```{r NPS_STATS}
+#load & tidy
+nps_stats <- read.csv("Inputs/NPS_Parks_Name_Code_Shapefile.csv") %>%
+  dplyr::rename(code = UNIT_CODE) %>%
+  dplyr::rename(name = UNIT_NAME) %>%
+  dplyr::rename(state = STATE) %>%
+  dplyr::rename(region = REGION) %>%
+  dplyr::rename(type = UNIT_TYPE) %>%
+  dplyr::rename(area_km2 = Area_km2) %>%
+  select(code, name, state, region, type, area_km2) %>%
+  arrange(code)
+
+# long story short, there are parks & preserves which share code.
+# this includes orig nps stats shapefile (had 415 obs but 407 unique codes).
+# for now, combining park & preserve area to maintain 1 code
+# re-assign area by adding park & preserves for those 8 dupes
+nps_area_temp <- nps_stats %>% group_by(code) %>%
+  summarise_at(vars(area_km2), sum)
+#remove old area
+nps_stats <- nps_stats[, c("code" , "name", "state", "region", "type")]
+# using join_all to ensure that only 1 value gets picked up for dupes
+# otherwise, left_join gives NA for parks and preserves
+nps_stats <- plyr::join(nps_area_temp, nps_stats,
+                        by = "code" , type = "left",
+                        match = "first")
+remove(nps_area_temp)
+```
+
+
+#########
+#CLIMATE#
+#########
+```{r CLIMATE}
+
+###PCs
+#PC1 Ensemble 2050s, RCP 8.5; N.b., reversing order b/c all anomalies are negative
+clim_PC1_2050_rcp85 <- read.csv("Inputs/NPVuln_Anomaly_pca1_future_85_2055_LAEA.csv") %>%
+  select(UNIT_CODE, MEAN) %>%
+  rename(code = UNIT_CODE, clim_pc1_anomaly = MEAN)
+clim_PC1_2050_rcp85$clim_pc1_anomaly <- (clim_PC1_2050_rcp85$clim_pc1_anomaly*-1)
+#PC2 Ensemble 2050s, RCP 8.5
+clim_PC2_2050_rcp85 <- read.csv("Inputs/NPVuln_Anomaly_pca2_future_85_2055_LAEA.csv") %>%
+  select(UNIT_CODE, MEAN) %>%
+  rename(code = UNIT_CODE, clim_pc2_anomaly = MEAN)
+
+
+
+### Wang & Notaro projections & measure of uncertainty
+# Wang and Notero Mean change in MAT, 2050s, RCP 8.5
+clim_WandN_MAT <- read.csv("Inputs/WandN_Temp_Annual_Means.csv") %>%
+  select(UNIT_CODE, TP852036ANNMEAN) %>%
+  rename(code = UNIT_CODE, clim_MAT_anomaly = TP852036ANNMEAN)
+
+# Wang and Notero Mean change in winter precip, 2050s, RCP 8.5
+clim_WandN_precip <- read.csv("Inputs/WandN_Precip_Seasonal_Means.csv") %>%
+  select(UNIT_CODE, PP852036DJFMEAN, PP852036JJAMEAN) %>%
+  rename(code = UNIT_CODE,
+         clim_precip_DJF_anomaly = PP852036DJFMEAN,
+         clim_precip_JJA_anomaly = PP852036JJAMEAN)
+
+# Coefficient of variation for MAT
+clim_WandN_MAT_covar <- read.csv ("Inputs/WandN_Temp_Annual_CoVariation.csv") %>%
+  select(UNIT_CODE, TP852036ANNCVAR) %>%
+  rename(code = UNIT_CODE, clim_MAT_covar = TP852036ANNCVAR)
+
+# Fractional agreement in direction of precip change
+clim_WandN_precip_frag <- read.csv ("Inputs/WandN_Precip_Seasonal_Fractional_Agreement.csv") %>%
+  select(UNIT_CODE, PP852036DJFFRAG, PP852036JJAFRAG) %>%
+  rename(code = UNIT_CODE,
+         clim_precip_DJF_frag = PP852036DJFFRAG,
+         clim_precip_JJA_frag = PP852036JJAFRAG)
+
+
+
+### Individual climate variable
+## N.b., all raw anomalies EXCEPT for RH & CMD with percent change
+
+# Precipitation as snow. Typically less snow, more rain therefore values negative.
+# For PAS ranking, more negative is more vulnerable, therefore *-1 below...
+# ... because I want big numbers to get ranked high (i.e., rank #1).
+# May consider setting all INCREASES in PAS (more snow) to zero
+clim_PAS <- read.csv("Inputs/NPVuln_Anomaly_2050s_rcp85_PAS_LAEA.csv") %>%
+  select(UNIT_CODE, MEAN) %>%
+  rename(code = UNIT_CODE,
+         clim_PAS_raw_anomaly = MEAN)
+clim_PAS$clim_PAS_raw_anomaly <- (clim_PAS$clim_PAS_raw_anomaly*-1)
+  
+  
+# Number of frost free days
+clim_NFFD <- read.csv("Inputs/NPVuln_Anomaly_2050s_rcp85_NFFD_LAEA.csv") %>%
+  select(UNIT_CODE, MEAN) %>%
+  rename(code = UNIT_CODE,
+         clim_NFFD_raw_anomaly = MEAN)  
+  
+
+# Relative humidity
+# NOTE PERCENT CHANGE
+clim_RH <- read.csv("Inputs/NPVuln_PerAnomaly_2050s_rcp85_RH_LAEA.csv") %>%
+  select(UNIT_CODE, MEAN) %>%
+  rename(code = UNIT_CODE,
+         clim_RH_perc_change = MEAN)  
+  
+
+# Hargreaves climatic moisture
+# NOTE PERCENT CHANGE
+clim_CMD <- read.csv("Inputs/NPVuln_PerAnomaly_2050s_rcp85_CMD_LAEA.csv") %>%
+  select(UNIT_CODE, MEAN) %>%
+  rename(code = UNIT_CODE,
+         clim_CMD_perc_change = MEAN)  
+  
+
+# EMT (extreme minimum temp)
+clim_ext_Tmin <- read.csv("Inputs/NPVuln_Anomaly_2050s_rcp85_EMT_LAEA.csv") %>%
+  select(UNIT_CODE, MEAN, MAX) %>%
+  rename(code = UNIT_CODE,
+         clim_ext_Tmin_mean_raw_anomaly = MEAN,
+         clim_ext_Tmin_max_raw_anomaly = MAX)  
+  
+
+# EXT (extreme high temp)
+clim_ext_Tmax <- read.csv("Inputs/NPVuln_Anomaly_2050s_rcp85_EXT_LAEA.csv") %>%
+  select(UNIT_CODE, MEAN, MAX) %>%
+  rename(code = UNIT_CODE,
+         clim_ext_Tmax_mean_raw_anomaly = MEAN,
+         clim_ext_Tmax_max_raw_anomaly = MAX)
+
+
+
+```
+
+
+#############
+#AT RISK SPP#
+#############
+```{r AT RISK SPP}
+## AT RISK SP - CHECK FOR CORRECT MOST UPDATED CSV VERSION!! ##
+## !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! ##
+## !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! ##
+## !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! ##
+spp_g1g2 <- read.csv("Inputs/spp_sum_FINAL_2017-07-31.csv") %>%
+    select(code, ttl_vv_g1g2, fish_g1g2) %>%
+  rename(g1g2_vert_vasc = ttl_vv_g1g2,
+         g1g2_fish = fish_g1g2)
+  
+```
+
+#############
+#DISTURBANCE#
+#############
+```{r DISTURBANCE}
+## NON-NATIVE - CHECK FOR CORRECT MOST UPDATED CSV VERSION!! ##
+## !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! ##
+## !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! ##
+## !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! ##
+spp_nonnat <- read.csv("Inputs/spp_sum_FINAL_2017-07-31.csv") %>%
+  select(code, ttl_vv_nonnat_prop, fish_nonnat_prop) %>%
+  rename(nonnat_prop_vert_vasc = ttl_vv_nonnat_prop,
+         nonnat_prop_fish = fish_nonnat_prop)
+
+
+## WILDFIRE
+# compute percent area of each park that's hazard 3 o4 4, hazard 3 or 4 or 5
+fire <- read.csv("Inputs/NPS_WildfirePotential_2014_wPercents_30kBuf.csv") %>%
+  select(UNIT_CODE, PER34AND5, PER4AND5) %>% 
+  dplyr::rename(code = UNIT_CODE,
+                fire_perc_area_345 = PER34AND5,
+                fire_perc_area_45 = PER4AND5) %>%
+  arrange(code)
+
+
+## DROUGHT
+# want change in drought events for winter & summer, per SPEI
+drought_winter <- read.csv("Inputs/NPVuln_Drght_RCP85_Winter55_LAEA.csv") %>%
+  select(UNIT_CODE, MEAN) %>%
+  dplyr::rename(code = UNIT_CODE, drought_winter = MEAN)
+
+drought_summer <- read.csv("Inputs/NPVuln_Drght_RCP85_Summer55_LAEA.csv") %>%
+  select(UNIT_CODE, MEAN) %>%
+  dplyr::rename(code = UNIT_CODE, drought_summer = MEAN)
+
+
+## PESTS  
+# want percent at-risk treed area  
+pest <- read.csv("Inputs/pest_summary.csv") %>%
+  select(Unit.code, X...of.treed.area.at.risk) %>%
+  rename(code = Unit.code,
+         pest_risk_prop_area = X...of.treed.area.at.risk) %>%
+  arrange(code)
+# these values are as percentages (e.g., 10%), which are by def NOT numeric.
+# remove the % symbol,  coerce into numeric, divide by 100
+pest$pest_risk_prop_area <-
+  (as.numeric(sub("%","",pest$pest_risk_prop_area))/100)
+```  
+
+
+#######
+#OTHER#
+#######
+```{r OTHER}
+# load human footprint only for buffers, not parks themselves
+footprint <- read.csv("Inputs/NPVun_30kbufonly_hfp_n_amer_LAEA.csv") %>%
+  select(UNIT_CODE, MEAN, MIN, MAX) %>%
+  rename(code = UNIT_CODE,
+         hfp_min = MIN,
+         hfp_max = MAX,
+         hfp_mean = MEAN) %>%
+  arrange(code)  
+
+
+# load forward climate velocity for buffer
+clim_velocity <- read.csv("Inputs/NPVuln_30kbuf_fwvel_ens_rcp85_2085_LAZ.csv") %>%
+  select(UNIT_CODE, MEAN, MIN, MAX) %>%
+  rename(code = UNIT_CODE,
+         velocity_fwd_min = MIN,
+         velocity_fwd_max = MAX,
+         velocity_fwd_mean = MEAN) %>%
+  arrange(code)
+
+# load invasion risk
+invasion_risk <- read.csv("Inputs/NPVuln_InvasiveRisk_Per_Area.csv") %>%
+  select(UNIT_CODE, inv.risk.index) %>%
+  rename(code = UNIT_CODE,
+         invasion_risk = inv.risk.index) %>%
+  arrange(code)  
+
+# load biome shift risk
+biome_risk <- read.csv("Inputs/NPVuln_BiomeRisk_Per_Area.csv") %>%
+  select(UNIT_CODE, biome.risk.index) %>%
+  rename(code = UNIT_CODE,
+         biome_risk = biome.risk.index) %>%
+  arrange(code) 
+
+# load land facet diversity
+land_facets <- read.csv("Inputs/NPVuln_landfacetdiversity_LAZ.csv") %>%
+  select(UNIT_CODE,) %>%
+  rename(code = UNIT_CODE,
+         land_facets_mean = MEAN) %>%
+  arrange(code) 
+
+# load current climate diversity
+cur_clim_diversity <- read.csv("Inputs/NPVuln_currentclimatediversity_LAZ.csv") %>%
+  select(UNIT_CODE, ) %>%
+  rename(code = UNIT_CODE,
+         cur_clim_diversity_mean = MEAN) %>%
+  arrange(code) 
+
+# load ecotypic diversity
+ecotypic_diversity <- read.csv("Inputs/NPVuln_ecotypicdiversity_LAZ.csv") %>%
+  select(UNIT_CODE, ) %>%
+  rename(code = UNIT_CODE,
+         ecotypic_diversity_mean = MEAN) %>%
+  arrange(code) 
+
+```
+  
+##########
+#ORGANIZE#
+##########
+
+```{r ORGANIZE}
+# Create list of all dataframes ASSUMING ONLY THE ABOVE DATASETS ARE LOADED.
+# list.dfs <- Filter(function(x) is(x, "data.frame"), mget(ls()))
+# problem is that I want all dfs joined to nps_stats, which has all parks & stats
+# but list is in alphabetical order... this is sloppy, but force it to be first
+aaa_nps_stats <- nps_stats ; remove(nps_stats)
+list.dfs <- Filter(function(x) is(x, "data.frame"), mget(ls()))
+
+# don't turn on plyr library b/c it messes with other (newer) dplyr stuff
+indicators_raw <- plyr::join_all(list.dfs,
+                             by = 'code',
+                             type = 'left',
+                             match = "first") 
+
+# Some remnant of the dupe codes mean NOT setting match to first gives tons dupes...
+# ...for those parks. But values are identical (if match = "all").
+# Therefore, I'm setting match = "first" 
+
+# Re-order per Julia table
+order <- read.csv("Inputs/order.csv")
+ordercol <- colnames(order)
+indicators_raw <- indicators_raw[,ordercol]
+remove(order)
+
+
+```
+
+############
+#RELATIVIZE#
+############
+```{r RELATIVIZE}
+
+library(vegan)
+
+#probably can only apply relativize functions to numeric columns
+# preserve nice col name order
+colnames <- colnames(indicators_raw)
+# extract only numeric columns -- remove area_km2, too
+nums <- sapply(indicators_raw, is.numeric) # nums is logical with col names
+temp <- indicators_raw[,nums]
+temp <- within(temp, rm("area_km2"))
+
+temp <- decostand(temp,
+                  method = "range", # set all values in col from 0-1
+                  margin = 2, # operates on columns (default for range anyways)
+                  na.rm = TRUE) # ignore missing values
+# drop scaled area_km2 which stayed in b/c it's numeric
+# bin 'em back together (joining won't work b/c numeric _01 doesn't have "code"")
+temp <- cbind(temp, aaa_nps_stats) 
+indicators_01 <- temp[,colnames]
+remove(temp)
+       
+
+
+```
+
+######
+#RANK#
+######
+```{r RANK}
+# Ranking functions map smallest inputs to smallest outputs. I want reverse.
+# b/c 1st most vulnerable will have largest indicators values for most indicators.
+# Therefore, set ranks into descneding order with "-"
+
+# Ranks on raw indicators
+temp <- indicators_raw[,nums]
+temp <- within(temp, rm("area_km2"))
+temp <- as.data.frame(sapply(-temp, dense_rank))
+temp <- cbind(temp, aaa_nps_stats)
+indicators_raw_rank <- temp[,colnames]
+remove(temp)
+
+
+
+# Ranks on scaled indicators
+temp <- indicators_01[,nums]
+temp <- within(temp, rm("area_km2"))
+temp <- as.data.frame(sapply(-temp, dense_rank))
+temp <- cbind(temp, aaa_nps_stats)
+indicators_01_rank <- temp[,colnames]
+remove(temp)
+
+
+
+
+```
+
+###########
+#WRITE CSV#
+###########
+``` {r WRITE CSV}
+
+currentDate <- Sys.Date()
+csvFileName <- paste("indicators_raw_",currentDate,".csv",sep="")
+write.csv(indicators_raw, file = paste("Outputs/",csvFileName,sep=""))
+
+csvFileName <- paste("indicators_01_",currentDate,".csv",sep="")
+write.csv(indicators_01, file = paste("Outputs/",csvFileName,sep=""))
+
+csvFileName <- paste("indicators_raw_rank_",currentDate,".csv",sep="")
+write.csv(indicators_raw_rank, paste("Outputs/",csvFileName,sep=""))
+
+csvFileName <- paste("indicators_01_rank_",currentDate,".csv",sep="")
+write.csv(indicators_01_rank, paste("Outputs/",csvFileName,sep=""))
+
+remove(csvFileName)
+
+
+```
